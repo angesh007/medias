@@ -1,4 +1,3 @@
-cat > nixpacks.toml << 'EOF'
 [phases.setup]
 nixPkgs = [
   "python311",
@@ -28,4 +27,4 @@ nixPkgs = [
   "xorg.libXrender",
   "xorg.libXtst",
 ]
-EOF
+
