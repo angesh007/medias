@@ -1,0 +1,31 @@
+cat > nixpacks.toml << 'EOF'
+[phases.setup]
+nixPkgs = [
+  "python311",
+  "chromium",
+  "nss",
+  "nspr",
+  "atk",
+  "cups",
+  "libdrm",
+  "libxkbcommon",
+  "xorg.libXcomposite",
+  "xorg.libXdamage",
+  "xorg.libXfixes",
+  "xorg.libXrandr",
+  "mesa",
+  "pango",
+  "cairo",
+  "alsa-lib",
+  "at-spi2-atk",
+  "at-spi2-core",
+  "dbus",
+  "expat",
+  "xorg.libX11",
+  "xorg.libXcursor",
+  "xorg.libXext",
+  "xorg.libXi",
+  "xorg.libXrender",
+  "xorg.libXtst",
+]
+EOF
