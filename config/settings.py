@@ -18,6 +18,10 @@ SECRET_KEY   = os.environ.get("DJANGO_SECRET_KEY", "dev-insecure-change-me")
 DEBUG        = os.environ.get("DJANGO_DEBUG", "True").lower() == "true"
 ALLOWED_HOSTS = os.environ.get("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
 
+CSRF_TRUSTED_ORIGINS = [
+    f"https://{h}" for h in ALLOWED_HOSTS if h not in ("localhost", "127.0.0.1")
+] + ["http://localhost:8000", "http://127.0.0.1:8000"]
+
 INSTALLED_APPS = [
     "django.contrib.admin",
     "django.contrib.auth",
