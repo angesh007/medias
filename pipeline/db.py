@@ -17,7 +17,7 @@ from typing import Any
 
 import psycopg2
 import psycopg2.extras
-
+from psycopg2.extras import Json
 log = logging.getLogger(__name__)
 
 # ── Config from .env ─────────────────────────────────────────────────────────
@@ -289,6 +289,16 @@ def insert_report(
     """
     try:
         with _cursor() as cur:
+            executive_summary = report.get("executive_summary")
+            qualitative_insight = report.get("qualitative_insight")
+
+            # Convert dict/list → JSON string if needed
+            if isinstance(executive_summary, (dict, list)):
+                executive_summary = json.dumps(executive_summary)
+
+            if isinstance(qualitative_insight, (dict, list)):
+                qualitative_insight = json.dumps(qualitative_insight)
+
             cur.execute(sql, (
                 rep_id,
                 run_id,
@@ -296,12 +306,12 @@ def insert_report(
                 meta.get("url") or report.get("url"),
                 meta.get("title") or report.get("title"),
                 meta.get("site") or report.get("site"),
-                json.dumps(report.get("authors")) if report.get("authors") else None,
+                Json(report.get("authors")) if report.get("authors") else None,
                 report.get("final_score") or report.get("score"),
-                report.get("executive_summary"),
-                report.get("qualitative_insight"),
+                executive_summary,
+                qualitative_insight,
                 int(report.get("refs_count", 0)),
-                json.dumps(report),                           # full payload in report_payload
+                Json(report),
                 storage_path,
             ))
         return rep_id

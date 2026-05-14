@@ -17,19 +17,20 @@ _csrf = os.environ.get("CSRF_TRUSTED_ORIGINS", "")
 CSRF_TRUSTED_ORIGINS = [o.strip() for o in _csrf.split(",") if o.strip()]
 # ── Apps ──────────────────────────────────────────────────────────────────────
 INSTALLED_APPS = [
+    'whitenoise.runserver_nostatic',   # ← must be FIRST
     "django.contrib.admin",
     "django.contrib.auth",
     "django.contrib.contenttypes",
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
-    "django_json_widget",  # JSON fields in admin
-    "dashboard",           # the pipeline dashboard app
+    "django_json_widget",
+    "dashboard",
 ]
-
 # ── Middleware ────────────────────────────────────────────────────────────────
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",   # ← add this line
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
