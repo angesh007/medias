@@ -1,420 +1,402 @@
 """
-pipeline/db.py
+pipeline/db.py  — AWS RDS PostgreSQL, schema = dev (DB_SCHEMA env var)
 
-Single Supabase database client for the entire pipeline.
-Writes to all 7 tables defined in your SQL schema:
-  pipeline_runs, pipeline_logs, scraped_articles,
-  detections, reports, pipeline_config, internal_documents
-
-All functions are safe to call from main.py and the step modules.
-Errors are logged but never re-raised so a DB write failure never
-crashes the pipeline itself.
+Tables match the exact Supabase schema you shared:
+  pipeline_runs, pipeline_logs, pipeline_config,
+  scraped_articles, detections, reports,
+  internal_documents
 """
 
 import json
 import logging
 import os
+import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any
 
-log = logging.getLogger("pipeline.db")
+import psycopg2
+import psycopg2.extras
 
-# ── lazy Supabase client (initialised once) ───────────────────
-_client = None
+log = logging.getLogger(__name__)
+
+# ── Config from .env ─────────────────────────────────────────────────────────
+_HOST     = os.environ["DB_HOST"]
+_PORT     = int(os.environ.get("DB_PORT", "5432"))
+_NAME     = os.environ["DB_NAME"]
+_USER     = os.environ["DB_USER"]
+_PASSWORD = os.environ["DB_PASSWORD"]
+_SCHEMA   = os.environ.get("DB_SCHEMA", "dev")
+
+# ── Connection ────────────────────────────────────────────────────────────────
+def _connect():
+    return psycopg2.connect(
+        host=_HOST,
+        port=_PORT,
+        dbname=_NAME,
+        user=_USER,
+        password=_PASSWORD,
+        options=f"-c search_path={_SCHEMA},public",
+        cursor_factory=psycopg2.extras.RealDictCursor,
+    )
 
 
-def _sb():
-    """Return (and lazily initialise) the Supabase client."""
-    global _client
-    if _client is None:
-        from supabase import create_client
-        url = os.environ["SUPABASE_URL"]
-        key = os.environ["SUPABASE_KEY"]
-        _client = create_client(url, key)
-    return _client
+@contextmanager
+def _cursor():
+    """Yield a cursor; commit on success, rollback on error, always close."""
+    conn = _connect()
+    try:
+        with conn.cursor() as cur:
+            yield cur
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _safe(fn, *args, **kwargs):
-    """Call fn; on any exception log and return None (never crash pipeline)."""
-    try:
-        return fn(*args, **kwargs)
-    except Exception as exc:
-        log.error("Supabase write failed: %s", exc)
-        return None
+# ══════════════════════════════════════════════════════════════════════════════
+# pipeline_runs
+# Exact columns: id(uuid), created_at, started_at, finished_at, status,
+#   current_step, step1_articles, step2_detections, step3_reports,
+#   failed_step, error_message, config_snapshot, storage_prefix
+# status CHECK: pending | started | running | complete | failed
+# ══════════════════════════════════════════════════════════════════════════════
+
+def create_run(run_id: str, config_snapshot: dict) -> None:
+    sql = f"""
+        INSERT INTO {_SCHEMA}.pipeline_runs
+            (id, status, current_step, config_snapshot,
+             storage_prefix, created_at)
+        VALUES (%s, 'pending', 0, %s, %s, NOW())
+    """
+    storage_prefix = f"runs/{run_id}/"
+    with _cursor() as cur:
+        cur.execute(sql, (run_id, json.dumps(config_snapshot), storage_prefix))
+    log.debug("Created run %s", run_id)
 
 
-# ══════════════════════════════════════════════════════════════
-#  pipeline_runs
-# ══════════════════════════════════════════════════════════════
-
-def create_run(run_id: str, config_snapshot: dict) -> dict | None:
-    """Insert a new pipeline_runs row. Returns the inserted row."""
-    row = {
-        "id":              run_id,
-        "started_at":      _now(),
-        "status":          "started",
-        "current_step":    0,
-        "config_snapshot": config_snapshot,
-        "storage_prefix":  f"runs/{run_id}/",
-    }
-    def _insert():
-        return _sb().table("pipeline_runs").insert(row).execute()
-    res = _safe(_insert)
-    return res.data[0] if res and res.data else None
-
-
-def update_run(run_id: str, **fields) -> None:
-    """Partial-update a pipeline_runs row."""
-    def _update():
-        return _sb().table("pipeline_runs").update(fields).eq("id", run_id).execute()
-    _safe(_update)
+def update_run(run_id: str, **kwargs) -> None:
+    """
+    Update any columns on pipeline_runs.
+    Accepted kwargs: status, current_step, step1_articles,
+                     step2_detections, step3_reports,
+                     failed_step, error_message,
+                     started_at, finished_at, storage_prefix
+    Note: column is  failed_step  (not failed_at_step)
+          and        finished_at  (not completed_at / failed_at)
+    """
+    if not kwargs:
+        return
+    cols = ", ".join(f"{k} = %s" for k in kwargs)
+    vals = list(kwargs.values()) + [run_id]
+    sql  = f"UPDATE {_SCHEMA}.pipeline_runs SET {cols} WHERE id = %s"
+    with _cursor() as cur:
+        cur.execute(sql, vals)
 
 
-def complete_run(run_id: str, step1: int, step2: int, step3: int) -> None:
-    update_run(
-        run_id,
-        status="complete",
-        current_step=3,
-        finished_at=_now(),
-        step1_articles=step1,
-        step2_detections=step2,
-        step3_reports=step3,
-    )
+def get_active_run() -> dict | None:
+    sql = f"""
+        SELECT * FROM {_SCHEMA}.pipeline_runs
+        WHERE status IN ('pending', 'started', 'running')
+        ORDER BY created_at ASC
+        LIMIT 1
+    """
+    with _cursor() as cur:
+        cur.execute(sql)
+        row = cur.fetchone()
+    return dict(row) if row else None
 
 
 def fail_run(run_id: str, step: int, error: str) -> None:
     update_run(
         run_id,
         status="failed",
-        finished_at=_now(),
-        failed_step=step,
+        failed_step=step,            # exact column name from your schema
         error_message=error[:2000],
+        finished_at=_now(),
     )
 
 
-def get_active_run() -> dict | None:
-    """Return the first run with status 'running' or 'started', or None."""
-    def _fetch():
-        return (
-            _sb()
-            .table("pipeline_runs")
-            .select("*")
-            .in_("status", ["running", "started"])
-            .limit(1)
-            .execute()
-        )
-    res = _safe(_fetch)
-    if res and res.data:
-        return res.data[0]
-    return None
+def complete_run(run_id: str, step1: int, step2: int, step3: int) -> None:
+    update_run(
+        run_id,
+        status="complete",           # your schema CHECK uses 'complete' not 'completed'
+        step1_articles=step1,
+        step2_detections=step2,
+        step3_reports=step3,
+        finished_at=_now(),
+    )
 
 
-def get_recent_runs(limit: int = 20) -> list[dict]:
-    def _fetch():
-        return (
-            _sb()
-            .table("pipeline_runs")
-            .select("*")
-            .order("created_at", desc=True)
-            .limit(limit)
-            .execute()
-        )
-    res = _safe(_fetch)
-    return res.data if res and res.data else []
+# ══════════════════════════════════════════════════════════════════════════════
+# pipeline_logs
+# Exact columns: id(bigserial), run_id, created_at, level, step, message
+# level CHECK: debug | info | warning | error
+# ══════════════════════════════════════════════════════════════════════════════
 
-
-# ══════════════════════════════════════════════════════════════
-#  pipeline_logs
-# ══════════════════════════════════════════════════════════════
-
-def log_to_db(run_id: str, message: str, level: str = "info", step: int | None = None) -> None:
-    """Write one log line to pipeline_logs."""
-    row = {
-        "run_id":  run_id,
-        "level":   level,
-        "message": message[:4000],
-    }
-    if step is not None:
-        row["step"] = step
-    def _insert():
-        return _sb().table("pipeline_logs").insert(row).execute()
-    _safe(_insert)
-
-
-def get_run_logs(run_id: str, limit: int = 500) -> list[dict]:
-    def _fetch():
-        return (
-            _sb()
-            .table("pipeline_logs")
-            .select("*")
-            .eq("run_id", run_id)
-            .order("created_at", desc=False)
-            .limit(limit)
-            .execute()
-        )
-    res = _safe(_fetch)
-    return res.data if res and res.data else []
-
-
-# ══════════════════════════════════════════════════════════════
-#  scraped_articles
-# ══════════════════════════════════════════════════════════════
-
-def insert_article(run_id: str, article: dict, storage_path: str = "") -> str | None:
+def log_to_db(
+    run_id: str,
+    message: str,
+    level: str = "info",
+    step: int | None = None,
+) -> None:
+    if level not in ("debug", "info", "warning", "error"):
+        level = "info"
+    sql = f"""
+        INSERT INTO {_SCHEMA}.pipeline_logs
+            (run_id, level, step, message, created_at)
+        VALUES (%s, %s, %s, %s, NOW())
     """
-    Insert one scraped article row.
-    Returns the new UUID from Supabase, or None on failure.
+    try:
+        with _cursor() as cur:
+            cur.execute(sql, (run_id, level, step, message[:4000]))
+    except Exception as exc:
+        log.warning("log_to_db failed: %s", exc)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# scraped_articles  (your real table name — NOT 'articles')
+# Exact columns: id(uuid), run_id, created_at, title, url(NOT NULL), site,
+#   published_date, snippet, search_term, date_range, country,
+#   scrape_status, scrape_method, failure_reason, content, storage_path
+# ══════════════════════════════════════════════════════════════════════════════
+
+def insert_article(run_id: str, article: dict, storage_path: str | None = None) -> str | None:
+    art_id = str(uuid.uuid4())
+    sql = f"""
+        INSERT INTO {_SCHEMA}.scraped_articles
+            (id, run_id, title, url, site,
+             published_date, snippet, search_term, date_range,
+             country, scrape_status, scrape_method, failure_reason,
+             content, storage_path, created_at)
+        VALUES
+            (%s, %s, %s, %s, %s,
+             %s, %s, %s, %s,
+             %s, %s, %s, %s,
+             %s, %s, NOW())
     """
-    row = {
-        "run_id":         run_id,
-        "title":          article.get("title", ""),
-        "url":            article.get("url", ""),
-        "site":           article.get("site", ""),
-        "published_date": article.get("published_date", ""),
-        "snippet":        article.get("snippet", ""),
-        "search_term":    article.get("search_term", ""),
-        "date_range":     article.get("date_range", ""),
-        "country":        article.get("country", ""),
-        "scrape_status":  article.get("scrape_status", ""),
-        "scrape_method":  article.get("scrape_method", ""),
-        "failure_reason": article.get("failure_reason"),
-        "content":        (article.get("body") or "")[:100_000],  # cap at 100k chars
-        "storage_path":   storage_path,
-    }
-    def _insert():
-        return _sb().table("scraped_articles").insert(row).execute()
-    res = _safe(_insert)
-    if res and res.data:
-        return res.data[0]["id"]
-    return None
+    try:
+        with _cursor() as cur:
+            cur.execute(sql, (
+                art_id,
+                run_id,
+                article.get("title", "")[:500],
+                article.get("url", ""),                       # NOT NULL
+                article.get("site") or article.get("domain") or article.get("source"),
+                article.get("published_date") or article.get("published_at") or article.get("date"),
+                article.get("snippet") or article.get("content", "")[:500],
+                article.get("search_term"),
+                article.get("date_range"),
+                article.get("country"),
+                article.get("scrape_status", "scraped"),
+                article.get("scrape_method"),
+                article.get("failure_reason"),
+                article.get("content"),
+                storage_path,
+            ))
+        return art_id
+    except Exception as exc:
+        log.error("insert_article failed: %s", exc)
+        return None
 
 
-# ══════════════════════════════════════════════════════════════
-#  detections
-# ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# detections
+# Exact columns: id(uuid), run_id, article_id, created_at, url, title, site,
+#   published_date, status, skip_reason, total_detections,
+#   strong_phobic, medium_phobic, weak_phobic,
+#   authors(jsonb), detection_payload(jsonb), storage_path
+# FK: article_id → scraped_articles(id)
+# ══════════════════════════════════════════════════════════════════════════════
 
 def insert_detection(
     run_id: str,
     article_id: str | None,
     detection: dict,
-    storage_path: str = "",
+    storage_path: str | None = None,
 ) -> str | None:
-    """
-    Insert one detection row.
-    detection is the merged dict from step2_detector.run().
-    Returns the new UUID or None.
-    """
+    det_id  = str(uuid.uuid4())
     summary = detection.get("summary", {})
+    sql = f"""
+        INSERT INTO {_SCHEMA}.detections
+            (id, run_id, article_id, url, title, site,
+             published_date, status, skip_reason,
+             total_detections, strong_phobic, medium_phobic, weak_phobic,
+             authors, detection_payload, storage_path, created_at)
+        VALUES
+            (%s, %s, %s, %s, %s, %s,
+             %s, %s, %s,
+             %s, %s, %s, %s,
+             %s, %s, %s, NOW())
+    """
+    try:
+        with _cursor() as cur:
+            cur.execute(sql, (
+                det_id,
+                run_id,
+                article_id,
+                detection.get("url"),
+                detection.get("title"),
+                detection.get("site") or detection.get("domain"),
+                detection.get("published_date") or detection.get("published_at"),
+                detection.get("status", "processed"),
+                detection.get("skip_reason"),
+                summary.get("total_detections", 0),
+                summary.get("strong_phobic", 0),
+                summary.get("medium_phobic", 0),
+                summary.get("weak_phobic", 0),
+                json.dumps(detection.get("authors")) if detection.get("authors") else None,
+                json.dumps(detection),                        # full payload in detection_payload
+                storage_path,
+            ))
+        return det_id
+    except Exception as exc:
+        log.error("insert_detection failed: %s", exc)
+        return None
 
-    # Store full detection payload as JSONB (detections list + summary)
-    payload = {
-        "summary":    summary,
-        "detections": detection.get("detections", []),
-        "authors":    detection.get("authors", []),
-    }
 
-    row = {
-        "run_id":            run_id,
-        "article_id":        article_id,
-        "url":               detection.get("url", ""),
-        "title":             detection.get("title", ""),
-        "site":              detection.get("site", ""),
-        "published_date":    detection.get("published_date", ""),
-        "status":            detection.get("status", "processed"),
-        "skip_reason":       detection.get("skip_reason"),
-        "total_detections":  summary.get("total_detections", 0),
-        "strong_phobic":     summary.get("strong_phobic", 0),
-        "medium_phobic":     summary.get("medium_phobic", 0),
-        "weak_phobic":       summary.get("weak_phobic", 0),
-        "authors":           detection.get("authors", []),
-        "detection_payload": payload,
-        "storage_path":      storage_path,
-    }
-    def _insert():
-        return _sb().table("detections").insert(row).execute()
-    res = _safe(_insert)
-    if res and res.data:
-        return res.data[0]["id"]
-    return None
-
-
-# ══════════════════════════════════════════════════════════════
-#  reports
-# ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# reports
+# Exact columns: id(uuid), run_id, detection_id, created_at, url, title, site,
+#   authors(jsonb), final_score(float), executive_summary, qualitative_insight,
+#   refs_count(int), report_payload(jsonb), storage_path
+# FK: detection_id → detections(id), run_id → pipeline_runs(id)
+# ══════════════════════════════════════════════════════════════════════════════
 
 def insert_report(
     run_id: str,
     detection_id: str | None,
     report: dict,
-    storage_path: str = "",
+    storage_path: str | None = None,
 ) -> str | None:
+    rep_id = str(uuid.uuid4())
+    meta   = report.get("meta", {})
+    sql = f"""
+        INSERT INTO {_SCHEMA}.reports
+            (id, run_id, detection_id, url, title, site,
+             authors, final_score, executive_summary, qualitative_insight,
+             refs_count, report_payload, storage_path, created_at)
+        VALUES
+            (%s, %s, %s, %s, %s, %s,
+             %s, %s, %s, %s,
+             %s, %s, %s, NOW())
     """
-    Insert one report row.
-    report is the dict from step3_reporter.run().
-    Returns the new UUID or None.
-    """
-    meta    = report.get("meta", {})
-    exec_s  = report.get("executive_summary", {})
-    refs    = report.get("refs", [])
-
-    row = {
-        "run_id":              run_id,
-        "detection_id":        detection_id,
-        "url":                 meta.get("url", ""),
-        "title":               meta.get("title", ""),
-        "site":                meta.get("site", ""),
-        "authors":             meta.get("authors", []),
-        "final_score":         exec_s.get("final_score"),
-        "executive_summary":   exec_s.get("text", ""),
-        "qualitative_insight": report.get("qualitative_insight", ""),
-        "refs_count":          len(refs),
-        "report_payload":      report,   # full JSON stored as JSONB
-        "storage_path":        storage_path,
-    }
-    def _insert():
-        return _sb().table("reports").insert(row).execute()
-    res = _safe(_insert)
-    if res and res.data:
-        return res.data[0]["id"]
-    return None
+    try:
+        with _cursor() as cur:
+            cur.execute(sql, (
+                rep_id,
+                run_id,
+                detection_id,
+                meta.get("url") or report.get("url"),
+                meta.get("title") or report.get("title"),
+                meta.get("site") or report.get("site"),
+                json.dumps(report.get("authors")) if report.get("authors") else None,
+                report.get("final_score") or report.get("score"),
+                report.get("executive_summary"),
+                report.get("qualitative_insight"),
+                int(report.get("refs_count", 0)),
+                json.dumps(report),                           # full payload in report_payload
+                storage_path,
+            ))
+        return rep_id
+    except Exception as exc:
+        log.error("insert_report failed: %s", exc)
+        return None
 
 
-# ══════════════════════════════════════════════════════════════
-#  pipeline_config
-# ══════════════════════════════════════════════════════════════
-
-def get_config(key: str, default: Any = None) -> Any:
-    """
-    Fetch one config value from pipeline_config by key.
-    The value column is JSONB so it's already parsed by supabase-py.
-    """
-    def _fetch():
-        return (
-            _sb()
-            .table("pipeline_config")
-            .select("value")
-            .eq("key", key)
-            .single()
-            .execute()
-        )
-    res = _safe(_fetch)
-    if res and res.data:
-        return res.data["value"]
-    return default
-
-
-def set_config(key: str, value: Any, description: str = "") -> None:
-    """Upsert a config value."""
-    row = {"key": key, "value": value}
-    if description:
-        row["description"] = description
-    def _upsert():
-        return _sb().table("pipeline_config").upsert(row, on_conflict="key").execute()
-    _safe(_upsert)
-
+# ══════════════════════════════════════════════════════════════════════════════
+# pipeline_config
+# Exact columns: id(bigserial), created_at, updated_at, key(unique text),
+#                value(jsonb), description
+# Stores config as key/value rows. main.py expects:
+#   key='sites'        value=["thewire.in", ...]
+#   key='date_ranges'  value=[["03/01/2024","03/31/2025"], ...]
+#   key='search_terms' value=["RSS", ...]
+#   key='country'      value="in"
+# ══════════════════════════════════════════════════════════════════════════════
 
 def load_pipeline_config() -> dict:
-    """
-    Load all pipeline_config rows and return as a flat dict.
-    Falls back to env vars when a key is missing from the DB.
-    """
-    def _fetch():
-        return _sb().table("pipeline_config").select("key,value").execute()
-    res = _safe(_fetch)
-    rows = res.data if res and res.data else []
-    cfg  = {r["key"]: r["value"] for r in rows}
-
-    # Merge with env-var secrets (never stored in DB)
-    cfg["serper_key"]       = os.environ.get("SERPER_API_KEY", "")
-    cfg["gemini_key"]       = os.environ.get("GEMINI_API_KEY", "")
-    cfg["brightdata_wss"]   = os.environ.get("BRIGHTDATA_WSS", "")
-    cfg["internal_doc_url"] = os.environ.get(
-        "INTERNAL_DOC_URL",
-        "https://yfjhxoaklcjekwncpiih.supabase.co/storage/v1/object/public/rss/Internaldoc.docx.pdf",
-    )
-
-    # Normalise types expected by step modules
-    if isinstance(cfg.get("sites"), list):
-        pass  # already a list from JSONB
-    else:
-        cfg["sites"] = ["thewire.in", "scroll.in", "ndtv.com"]
-
-    if isinstance(cfg.get("date_ranges"), list):
-        # Stored as [["MM/DD/YYYY","MM/DD/YYYY"], ...]
-        cfg["date_ranges"] = [tuple(dr) for dr in cfg["date_ranges"]]
-    else:
-        cfg["date_ranges"] = [("03/01/2024", "03/31/2025")]
-
-    if isinstance(cfg.get("search_terms"), list):
-        pass
-    else:
-        cfg["search_terms"] = ["RSS", "Rashtriya Swayamsevak Sangh"]
-
-    cfg.setdefault("country",              os.environ.get("COUNTRY", "in"))
-    cfg.setdefault("max_results_per_site", int(os.environ.get("MAX_RESULTS_PER_SITE", 50)))
-    cfg.setdefault("delay_between_sites",  2.0)
-    cfg.setdefault("delay_between_articles", 1.5)
-    cfg.setdefault("min_content_length",   300)
-    cfg.setdefault("use_tier1", True)
-    cfg.setdefault("use_tier2", True)
-    cfg.setdefault("use_tier3", True)
-    cfg.setdefault("use_tier4", bool(os.environ.get("BRIGHTDATA_WSS")))
-
-    return cfg
+    config: dict[str, Any] = {
+        "sites":        [],
+        "date_ranges":  [],
+        "search_terms": [],
+        "country":      os.environ.get("COUNTRY", "in"),
+    }
+    try:
+        with _cursor() as cur:
+            cur.execute(f"SELECT key, value FROM {_SCHEMA}.pipeline_config")
+            for row in cur.fetchall():
+                k, v = row["key"], row["value"]
+                if k in config:
+                    config[k] = v   # psycopg2 RealDictCursor returns jsonb already parsed
+    except Exception as exc:
+        log.error("load_pipeline_config failed: %s", exc)
+    return config
 
 
-# ══════════════════════════════════════════════════════════════
-#  pending_runs queue  (stored in pipeline_config key='pending_runs')
-# ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# pending_runs
+# Your schema has no separate pending_runs table.
+# We implement the queue using pipeline_runs itself:
+#   enqueue  → create a run with status='pending' and queued=true in snapshot
+#   pop      → atomically claim the oldest such run → status='started'
+# ══════════════════════════════════════════════════════════════════════════════
 
 def enqueue_pending(triggered_by: str = "manual") -> None:
-    """Push a pending run entry onto the queue in pipeline_config."""
-    queue: list = get_config("pending_runs", []) or []
-    queue.append({"triggered_by": triggered_by, "queued_at": _now()})
-    set_config("pending_runs", queue)
-    log.info("Enqueued pending run (triggered_by=%s). Queue length: %d", triggered_by, len(queue))
+    run_id = str(uuid.uuid4())
+    create_run(run_id, {"triggered_by": triggered_by, "queued": True})
+    log.info("Enqueued pending run %s (triggered_by=%s)", run_id, triggered_by)
 
 
 def pop_pending() -> dict | None:
-    """Pop (FIFO) the oldest pending run from the queue. Returns it or None."""
-    queue: list = get_config("pending_runs", []) or []
-    if not queue:
-        return None
-    item  = queue.pop(0)
-    set_config("pending_runs", queue)
-    return item
-
-
-# ══════════════════════════════════════════════════════════════
-#  internal_documents
-# ══════════════════════════════════════════════════════════════
-
-def register_internal_doc(storage_path: str, filename: str, size_bytes: int = 0) -> None:
     """
-    Mark a new internal document as active (deactivates any previous one).
-    Call this after you manually upload a new Internaldoc to Supabase Storage.
+    Atomically claim the oldest queued-pending run,
+    mark it 'started', and return it so orchestrate() can execute it.
     """
-    def _deactivate():
-        return (
-            _sb()
-            .table("internal_documents")
-            .update({"is_active": False})
-            .eq("is_active", True)
-            .execute()
+    sql = f"""
+        UPDATE {_SCHEMA}.pipeline_runs
+        SET    status = 'started', started_at = NOW()
+        WHERE  id = (
+            SELECT id FROM {_SCHEMA}.pipeline_runs
+            WHERE  status = 'pending'
+              AND  config_snapshot->>'queued' = 'true'
+            ORDER BY created_at ASC
+            LIMIT 1
+            FOR UPDATE SKIP LOCKED
         )
-    _safe(_deactivate)
+        RETURNING *
+    """
+    with _cursor() as cur:
+        cur.execute(sql)
+        row = cur.fetchone()
+    return dict(row) if row else None
 
-    row = {
-        "storage_path": storage_path,
-        "bucket":       os.environ.get("SUPABASE_BUCKET", "rss"),
-        "filename":     filename,
-        "size_bytes":   size_bytes,
-        "is_active":    True,
-    }
-    def _insert():
-        return _sb().table("internal_documents").insert(row).execute()
-    _safe(_insert)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# internal_documents  (used by step3_reporter as fallback to INTERNAL_DOC_URL)
+# Exact columns: id, uploaded_at, storage_path, bucket, filename,
+#                size_bytes, is_active, notes
+# Unique index ensures only one active row at a time.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_active_internal_doc() -> dict | None:
+    """Return the currently active internal document record (is_active=true)."""
+    sql = f"""
+        SELECT * FROM {_SCHEMA}.internal_documents
+        WHERE is_active = TRUE
+        LIMIT 1
+    """
+    try:
+        with _cursor() as cur:
+            cur.execute(sql)
+            row = cur.fetchone()
+        return dict(row) if row else None
+    except Exception as exc:
+        log.error("get_active_internal_doc failed: %s", exc)
+        return None

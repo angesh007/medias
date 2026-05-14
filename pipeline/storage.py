@@ -1,100 +1,139 @@
 """
-pipeline/storage.py
-
-Thin wrapper around Supabase Storage SDK.
-All file I/O in the pipeline goes through this module so
-switching backends later only requires changing this file.
+pipeline/storage.py  — AWS S3 replacement for Supabase Storage
+Bucket : mediareport01   (arn:aws:s3:::mediareport01)
+Schema  : all keys are prefixed with  dev/
+          so  runs/{run_id}/step1_scraped/foo.json
+          becomes  dev/runs/{run_id}/step1_scraped/foo.json
 """
 
-import io
 import json
 import logging
 import os
-import requests
+
+import boto3
+from botocore.exceptions import ClientError
 
 log = logging.getLogger(__name__)
 
-SUPABASE_URL    = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY    = os.environ.get("SUPABASE_KEY", "")
-SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "rss")
+# ── Config from .env ────────────────────────────────────────────────────────
+_BUCKET      = os.environ.get("S3_BUCKET_NAME", "mediareport01")
+_REGION      = os.environ.get("AWS_REGION", "us-east-2")
+_URL_EXPIRY  = int(os.environ.get("S3_URL_EXPIRY", "3600"))
+_SCHEMA      = os.environ.get("DB_SCHEMA", "dev")          # used as S3 key prefix
+
+# ── Boto3 client (credentials come from env: AWS_ACCESS_KEY_ID / SECRET) ───
+def _client():
+    return boto3.client(
+        "s3",
+        region_name=_REGION,
+        aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+    )
 
 
-def _headers() -> dict:
-    return {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type": "application/json",
-    }
+def _prefixed(path: str) -> str:
+    """Prepend the schema prefix (e.g. 'dev') to every S3 key."""
+    # Avoid double-slash if path already starts with the prefix
+    path = path.lstrip("/")
+    if path.startswith(f"{_SCHEMA}/"):
+        return path
+    return f"{_SCHEMA}/{path}"
 
 
-def upload_json(storage_path: str, data: dict) -> str:
+# ── Public API (same signatures as the old Supabase version) ────────────────
+
+def upload_json(path: str, data: dict) -> str:
     """
-    Upload a dict as JSON to Supabase Storage.
+    Upload a dict as JSON to S3.
 
     Args:
-        storage_path: path inside the bucket, e.g. "runs/abc/step1/article_001.json"
-        data:         dict to serialise and upload
+        path : relative key, e.g. "runs/{run_id}/step1_scraped/foo.json"
+        data : dict to serialise
 
     Returns:
-        Public URL of the uploaded object (or empty string on failure).
+        A pre-signed HTTPS URL valid for S3_URL_EXPIRY seconds.
+        main.py stores this URL in the DB as the storage_path.
     """
-    payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
-    url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{storage_path}"
+    key = _prefixed(path)
+    body = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
 
-    resp = requests.post(
-        url,
-        headers={
-            "apikey": SUPABASE_KEY,
-            "Authorization": f"Bearer {SUPABASE_KEY}",
-            "Content-Type": "application/json",
-        },
-        data=payload,
-        timeout=30,
-    )
+    try:
+        _client().put_object(
+            Bucket=_BUCKET,
+            Key=key,
+            Body=body,
+            ContentType="application/json",
+        )
+        log.debug("Uploaded s3://%s/%s", _BUCKET, key)
+    except ClientError as exc:
+        log.error("S3 upload failed for key %s: %s", key, exc)
+        raise
 
-    if resp.status_code in (200, 201):
-        public_url = f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{storage_path}"
-        log.info("Uploaded → %s", public_url)
-        return public_url
-    else:
-        log.error("Upload failed [%s] %s → %s", resp.status_code, storage_path, resp.text[:200])
-        return ""
+    return generate_presigned_url(key)
 
 
-def download_bytes(storage_path: str) -> bytes:
-    """Download raw bytes from Supabase Storage."""
-    url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{storage_path}"
-    resp = requests.get(
-        url,
-        headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"},
-        timeout=60,
-    )
-    resp.raise_for_status()
-    return resp.content
+def upload_bytes(path: str, data: bytes, content_type: str = "application/octet-stream") -> str:
+    """
+    Upload raw bytes to S3 (kept for any future use).
+
+    Returns a pre-signed URL.
+    """
+    key = _prefixed(path)
+    try:
+        _client().put_object(
+            Bucket=_BUCKET,
+            Key=key,
+            Body=data,
+            ContentType=content_type,
+        )
+        log.debug("Uploaded bytes s3://%s/%s", _BUCKET, key)
+    except ClientError as exc:
+        log.error("S3 upload (bytes) failed for key %s: %s", key, exc)
+        raise
+
+    return generate_presigned_url(key)
 
 
-def download_json(storage_path: str) -> dict:
-    """Download and parse a JSON file from Supabase Storage."""
-    raw = download_bytes(storage_path)
-    return json.loads(raw.decode("utf-8"))
+def download_json(path: str) -> dict:
+    """
+    Download and parse a JSON object from S3.
+    path is the same relative key passed to upload_json.
+    """
+    key = _prefixed(path)
+    try:
+        resp = _client().get_object(Bucket=_BUCKET, Key=key)
+        return json.loads(resp["Body"].read().decode("utf-8"))
+    except ClientError as exc:
+        log.error("S3 download failed for key %s: %s", key, exc)
+        raise
 
 
-def download_from_url(url: str) -> bytes:
-    """Download from any public Supabase URL (used for the internal PDF doc)."""
-    resp = requests.get(url, timeout=60)
-    resp.raise_for_status()
-    return resp.content
+def generate_presigned_url(key: str, expiry: int | None = None) -> str:
+    """
+    Generate a pre-signed GET URL for any S3 key.
+    key may be a full prefixed key (dev/runs/…) or a relative one.
+    """
+    # If caller passes a raw relative path, prefix it
+    if not key.startswith(f"{_SCHEMA}/"):
+        key = _prefixed(key)
+
+    expiry = expiry or _URL_EXPIRY
+    try:
+        url = _client().generate_presigned_url(
+            "get_object",
+            Params={"Bucket": _BUCKET, "Key": key},
+            ExpiresIn=expiry,
+        )
+        return url
+    except ClientError as exc:
+        log.error("Failed to generate pre-signed URL for %s: %s", key, exc)
+        raise
 
 
-def list_folder(prefix: str) -> list[str]:
-    """List object keys under a storage prefix."""
-    url = f"{SUPABASE_URL}/storage/v1/object/list/{SUPABASE_BUCKET}"
-    resp = requests.post(
-        url,
-        headers=_headers(),
-        json={"prefix": prefix, "limit": 1000},
-        timeout=30,
-    )
-    if resp.status_code == 200:
-        return [obj["name"] for obj in resp.json()]
-    return []
+def public_url(path: str) -> str:
+    """
+    Return the direct S3 HTTPS URL (only works if bucket/object is public).
+    Use generate_presigned_url() for private objects.
+    """
+    key = _prefixed(path)
+    return f"https://{_BUCKET}.s3.{_REGION}.amazonaws.com/{key}"

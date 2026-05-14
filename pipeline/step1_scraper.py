@@ -247,7 +247,7 @@ def run(config: dict) -> list[dict]:
             "scraped_at": ISO timestamp,
         }
     """
-    serper_key   = config["serper_key"]
+    serper_key = config.get("serper_key") or os.environ.get("SERPER_API_KEY")
     sites        = config.get("sites", [])
     date_ranges  = config.get("date_ranges", [])
     search_terms = config.get("search_terms", ["RSS"])
