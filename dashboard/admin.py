@@ -187,17 +187,15 @@ class PipelineRunAdmin(admin.ModelAdmin):
 
     @admin.action(description="▶ Trigger a new pipeline run")
     def trigger_new_run(self, request, queryset):
+        import threading
         try:
-            subprocess.Popen(
-                [sys.executable, "main.py"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            from main import orchestrate
+            t = threading.Thread(target=orchestrate, kwargs={"triggered_by": "admin_ui"}, daemon=True)
+            t.start()
             self.message_user(request, "New pipeline run triggered!", messages.SUCCESS)
         except Exception as exc:
-            self.message_user(request, f"Failed: {exc}", messages.ERROR)
-
-
+            self.message_user(request, f"Failed to trigger run: {exc}", messages.ERROR)
+            
 # ══════════════════════════════════════════════════════════════
 #  SCRAPED ARTICLES ADMIN
 # ══════════════════════════════════════════════════════════════
